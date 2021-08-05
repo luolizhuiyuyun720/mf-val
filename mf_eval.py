@@ -118,14 +118,23 @@ def cummean(x: np.array) -> np.array:
         return np.divide(sum_vals, count_vals, out=np.zeros_like(sum_vals), where=count_vals != 0)
 
 # dt_box are sorted as score
-def accumulate(gt_box: list,
+def accumulate(gt_box: dict,
                dt_box: list, 
                class_name: str,
                dist_th: float = 0.5):
-    gt_mask = [k for k in range(len(gt_box)) if gt_box[k]['name'] == class_name]
+    # gt_mask = [k for k in range(len(gt_box)) if gt_box[k]['name'] == class_name]
+
+    gt_count = 0
+    gt_mask = {}
+    for key in gt_box.keys():
+        gt_filter = [k for k in range(len(gt_box[key])) if gt_box[key][k]['name'] == class_name]
+        if len(gt_filter) > 0:
+            gt_mask[key] = gt_filter
+            gt_count = gt_count + len(gt_filter)
+
+
     # mask = [k if gt_box['name'][k] == class_name else 0 for k in range(len(gt_box))]
-    npos = len(gt_mask)
-    if npos == 0:
+    if gt_count == 0:
         return None, None
 
     dt_mask = [k for k in range(len(dt_box)) if dt_box[k]['name'] == class_name]
@@ -135,10 +144,12 @@ def accumulate(gt_box: list,
 
     pred_confs = [dt_box[k]['scores'] for k in dt_mask]
     sortind = [dt_mask[i] for (v, i) in sorted((v, i) for (i, v) in enumerate(pred_confs))][::-1]
+
+    match_bbox = {'image_idx': [],
+                  'dt_idx': [],
+                  'gt_idx': []}
  
-    match_data = {'dt_idx': [],
-                  'gt_idx': [],
-                  'trans_err': [],
+    match_data = {'trans_err': [],
                   'vel_err': [],
                   'scale_err': [],
                   'orient_err': [],
@@ -148,7 +159,9 @@ def accumulate(gt_box: list,
     tp = []
     fp = []
     conf = []
-    gt_taken= []
+    gt_taken = {}
+    for frame_id in gt_mask.keys():
+        gt_taken[frame_id] = []
     
     for dt_idx in sortind:
         dt_loc = dt_box[dt_idx]['locations']
@@ -162,17 +175,23 @@ def accumulate(gt_box: list,
         min_dist = np.inf
         match_gt_idx = None
 
-        for gt_idx in gt_mask:
-            if gt_idx in gt_taken:
+        if image_idx not in gt_mask.keys():
+            tp.append(0)
+            fp.append(1)
+            conf.append(dt_score)
+            continue
+
+        for gt_ind in range(len(gt_mask[image_idx])):
+            gt_idx = gt_mask[image_idx][gt_ind]
+            if gt_idx in gt_taken[image_idx]:
                 continue
 
-            if gt_box[gt_idx]['image_idx'] != image_idx:
-                continue
+            gt_box_info = gt_box[image_idx][gt_idx]
 
-            gt_loc = gt_box[gt_idx]['locations']
-            gt_dim = gt_box[gt_idx]['dimensions']
-            gt_velo = gt_box[gt_idx]['velocity']
-            gt_yaw = gt_box[gt_idx]['rotation_y']
+            gt_loc = gt_box_info['locations']
+            gt_dim = gt_box_info['dimensions']
+            gt_velo = gt_box_info['velocity']
+            gt_yaw = gt_box_info['rotation_y']
 
             dist = center_distance(gt_loc, dt_loc)
             if dist < dist_th:
@@ -182,15 +201,13 @@ def accumulate(gt_box: list,
         is_match = min_dist < dist_th
 
         if is_match:
-            gt_taken.append(match_gt_idx)
+            gt_taken[image_idx].append(match_gt_idx)
 
-            gt_loc = gt_box[match_gt_idx]['locations']
-            gt_dim = gt_box[match_gt_idx]['dimensions']
-            gt_velo = gt_box[match_gt_idx]['velocity']
-            gt_yaw = gt_box[match_gt_idx]['rotation_y']
+            gt_loc = gt_box[image_idx][match_gt_idx]['locations']
+            gt_dim = gt_box[image_idx][match_gt_idx]['dimensions']
+            gt_velo = gt_box[image_idx][match_gt_idx]['velocity']
+            gt_yaw = gt_box[image_idx][match_gt_idx]['rotation_y']
 
-            match_data['dt_idx'].append(dt_idx)
-            match_data['gt_idx'].append(match_gt_idx)
             match_data['trans_err'].append(center_distance(gt_loc, dt_loc))
             match_data['vel_err'].append(velocity_l2(gt_velo, dt_velo))
             match_data['scale_err'].append(1-scale_iou(gt_dim, dt_dim))
@@ -198,6 +215,10 @@ def accumulate(gt_box: list,
             match_data['attr_err'].append(1-attr_acc(class_name, name))
             match_data['conf'].append(dt_score)
             conf.append(dt_score)
+
+            match_bbox['image_idx'].append(image_idx)
+            match_bbox['gt_idx'].append(match_gt_idx)
+            match_bbox['dt_idx'].append(dt_box[dt_idx]['index'])
 
             tp.append(1)
             fp.append(0)
@@ -215,7 +236,7 @@ def accumulate(gt_box: list,
 
     # Calculate precision and recall.
     prec = tp / (fp + tp)
-    rec = tp / float(npos)
+    rec = tp / float(gt_count)
 
     rec_interp = np.linspace(0, 1, 101)  # 101 steps, from 0% to 100% recall.
     prec = np.interp(rec_interp, rec, prec, right=0)
@@ -229,7 +250,7 @@ def accumulate(gt_box: list,
                   'orient_err': []} 
 
     for key in match_data.keys():
-        if key == "conf" or key == 'dt_idx' or key == 'gt_idx':
+        if key == "conf":
             continue  # Confidence is used as reference to align with fp and tp. So skip in this step.
 
         else:
@@ -253,6 +274,7 @@ def Json2BBoxInfo(json_file):
     frame_count = len(o)
 
     json_list = []
+    json_dict = {}
 
     for k in range(frame_count):
         if o[k] is None:
@@ -264,6 +286,8 @@ def Json2BBoxInfo(json_file):
             continue
 
         image_idx = o[k]['image_idx']
+        json_dict[image_idx] = []
+
         for m in range(det_count):
             bboxinfo = {}
             bboxinfo['image_idx'] = image_idx
@@ -278,8 +302,9 @@ def Json2BBoxInfo(json_file):
                 bboxinfo['scores'] = o[k]['score'][m]
             bboxinfo['velocity'] = o[k]['velocity'][m]
             json_list.append(bboxinfo)
+            json_dict[image_idx].append(bboxinfo)
 
-    return json_list
+    return json_list, json_dict
 
 if __name__ == '__main__':
     # cfg = Config.fromfile('./config.py')
@@ -288,11 +313,11 @@ if __name__ == '__main__':
     dt_file = '/media/lynn/B2EE9C02EE9BBD53/mf/WANGSHUO/August1/dt.json'
     # dt_file = '/media/lynn/B2EE9C02EE9BBD53/mf/WANGSHUO/August1/cpp_dt2.json'
 
-    dt_list = Json2BBoxInfo(dt_file)
-    gt_list = Json2BBoxInfo(gt_file)
+    dt_list, dt_dict = Json2BBoxInfo(dt_file)
+    gt_list, gt_dict = Json2BBoxInfo(gt_file)
 
     # class_name = ['bicycle', 'pedestr', 'Traffic_cone', 'unknown','car', 'truck', 'bus', 'motorcycle']
-    class_name = ['unknown']
+    class_name = ['bicycle']
 
     match_data_cls = {}
     stat_data_cls = {}
@@ -300,7 +325,7 @@ if __name__ == '__main__':
     quantile = [25, 50, 75, 80, 85, 90, 95, 99]
 
     for cls_name in class_name:
-        match_data, stat_data = accumulate(gt_list, dt_list,cls_name)
+        match_data, stat_data = accumulate(gt_dict, dt_list,cls_name)
         if match_data is None or stat_data is None:
             print('invalid class_name: ', cls_name)
             continue
