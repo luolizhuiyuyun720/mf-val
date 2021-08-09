@@ -214,7 +214,7 @@ def points_to_bird_view(x, y):
     b = np.clip(b, a_max=(cfg.Y_MAX - cfg.Y_MIN) / cfg.VOXEL_Y_SIZE * cfg.BV_LOG_FACTOR, a_min=0)
     return a, b
 
-def DrawBBoxInfo(img, bbox_info, color, velo_color, text_color, text_offset, thickness):
+def DrawBBoxInfo(img, bbox_info, color, velo_color, text_color, text_offset, thickness, filter_cls = "None"):
     box_corner = center2cornor_bbox3d(bbox_info)
     if box_corner is None:
         return img
@@ -236,6 +236,11 @@ def DrawBBoxInfo(img, bbox_info, color, velo_color, text_color, text_offset, thi
         track_id = bbox_info['track_id']
 
     for k in range(len(box_corner)):
+        if filter_cls == "None":
+            pass
+        else:
+            if bbox_info['name'][k] != filter_cls:
+                continue
         box = box_corner[k]
         x0, y0 = points_to_bird_view(*box[0, 0:2])
         x1, y1 = points_to_bird_view(*box[1, 0:2])
@@ -291,7 +296,7 @@ def DrawFrameImage(bin_file, gt_box_info, dt_box_info, output_file):
 
     # TODO: draw bbox
     img = DrawBBoxInfo(img, gt_box_info, (255,0,0), (255,128,0), (0,0,0), [2,-5], 1)
-    img = DrawBBoxInfo(img, dt_box_info, (65,105,255), (0, 0, 255), (0, 0, 0), [-2, 5], 1)
+    img = DrawBBoxInfo(img, dt_box_info, (65,105,255), (0, 0, 255), (0, 0, 0), [-2, 5], 1, 'Unknown')
 
     bird_view = DrawAnnotation(img)
 

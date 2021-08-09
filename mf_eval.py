@@ -20,6 +20,29 @@ def center_distance(gt_box: list, pred_box: list) -> float:
     """
     return np.linalg.norm(np.array(pred_box[:2]) - np.array(gt_box[:2]))
 
+def riou_distance(gt_box: list, pred_box: list) -> float:
+    """
+    gt_box = [x,y,z, w, l, h, theta]
+    dt_box = [x,y,z, w, l, h, theta]
+    """
+    r1 = ((gt_box[0], gt_box[1]), (gt_box[3], gt_box[4]), gt_box[6] * 360.0/np.pi)
+    r2 = ((pred_box[0], pred_box[1]), (pred_box[3], pred_box[4]), pred_box[6] * 360.0/np.pi)
+    int_pts = cv2.rotatedRectangleIntersection(r1, r2)[1]
+    
+    if int_pts is None:
+        return np.nan
+    else:
+        order_pts = cv2.convexHull(int_pts, returnPoints=True)
+        inter_area = cv2.contourArea(order_pts)
+        
+        area1 = gt_box[3] * gt_box[4]
+        area2 = pred_box[3] * pred_box[4]
+
+        iou = inter_area * 1.0 / (area1 + area2 - inter_area)
+
+        return 1.0 - iou
+
+
 def velocity_l2(gt_box_vel:list, pred_box_vel:list) -> float:
     """
     L2 distance between the velocity vectors (xy only).
@@ -117,6 +140,38 @@ def cummean(x: np.array) -> np.array:
         count_vals = np.cumsum(~np.isnan(x))  # Number of non-nans up to each position.
         return np.divide(sum_vals, count_vals, out=np.zeros_like(sum_vals), where=count_vals != 0)
 
+def calc_tp(match_data: dict, confidence: list, min_recall: float, metric_name: str) -> float:
+    first_ind = round(100 * min_recall) + 1  # +1 to exclude the error at min recall.
+    last_ind = 0 # md.max_recall_ind  # First instance of confidence = 0 is index of max achieved recall.
+
+    confidence = sorted(confidence, reverse=True)
+    non_zero = np.nonzero(confidence)[0]
+    if len(non_zero) > 0:  # If there are no matches, all the confidence values will be zero.
+        max_recall_ind = non_zero[-1]
+
+    if last_ind < first_ind:
+        return 1.0  # Assign 1 here. If this happens for all classes, the score for that TP metric will be 0.
+    else:
+        return float(np.mean(getattr(md, metric_name)[first_ind: last_ind + 1]))  # +1 to include error at max recall.
+
+def calc_ap(precision: list, min_recall: float, min_precision: float) -> float:
+    
+    assert 0 <= min_precision < 1
+    assert 0 <= min_recall <= 1
+
+    prec = np.copy(precision)
+    # prec = prec[::-1]
+    prec = prec[round(100 * min_recall) + 1:]  # Clip low recalls. +1 to exclude the min recall bin.
+    prec -= min_precision
+    prec[prec < 0] = 0
+    return float(np.mean(prec)) / (1.0 - min_precision)
+
+def calc_my_ap(precision: list):
+    prec = np.copy(precision)
+    bins = [k for k in prec.tolist() if k > 0]
+    return float(np.sum(prec)) / float(len(bins))
+
+
 # dt_box are sorted as score
 def accumulate(gt_box: dict,
                dt_box: list, 
@@ -131,16 +186,18 @@ def accumulate(gt_box: dict,
         if len(gt_filter) > 0:
             gt_mask[key] = gt_filter
             gt_count = gt_count + len(gt_filter)
+            if class_name == 'Unknown':
+                print(key+'.bin')
 
 
     # mask = [k if gt_box['name'][k] == class_name else 0 for k in range(len(gt_box))]
     if gt_count == 0:
-        return None, None
+        return None, None, None, None, None, None
 
     dt_mask = [k for k in range(len(dt_box)) if dt_box[k]['name'] == class_name]
    
     if len(dt_mask) == 0:
-        return None, None
+        return None, None, None, None, None, None
 
     pred_confs = [dt_box[k]['scores'] for k in dt_mask]
     sortind = [dt_mask[i] for (v, i) in sorted((v, i) for (i, v) in enumerate(pred_confs))][::-1]
@@ -165,8 +222,14 @@ def accumulate(gt_box: dict,
     
     for dt_idx in sortind:
         dt_loc = dt_box[dt_idx]['locations']
-        dt_dim = dt_box[dt_idx]['dimensions']
-        dt_velo = dt_box[dt_idx]['velocity']
+
+        dt_dim = dt_box[dt_idx]['dimensions'] # h, w, l
+        dt_dim = [dt_dim[1], dt_dim[2], dt_dim[0]] # w, l, h
+        
+        dt_velo = [0.0, 0.0]
+        if 'velocity' in dt_box[dt_idx].keys():
+            dt_velo = dt_box[dt_idx]['velocity']
+
         dt_score = dt_box[dt_idx]['scores']
         dt_yaw = dt_box[dt_idx]['rotation_y']
         name = dt_box[dt_idx]['name']
@@ -189,11 +252,15 @@ def accumulate(gt_box: dict,
             gt_box_info = gt_box[image_idx][gt_idx]
 
             gt_loc = gt_box_info['locations']
-            gt_dim = gt_box_info['dimensions']
+            gt_dim = gt_box_info['dimensions'] # h, w, l
+            gt_dim = [gt_dim[1], gt_dim[2], gt_dim[0]] # w, l, h
             gt_velo = gt_box_info['velocity']
             gt_yaw = gt_box_info['rotation_y']
 
             dist = center_distance(gt_loc, dt_loc)
+            # dist = riou_distance([gt_loc[0], gt_loc[1], gt_loc[2], gt_dim[0], gt_dim[1], gt_dim[2], gt_yaw], 
+            #                      [dt_loc[0], dt_loc[1], dt_loc[2], dt_dim[0], dt_dim[1], dt_dim[2], dt_yaw])
+
             if dist < dist_th:
                 min_dist = dist
                 match_gt_idx = gt_idx
@@ -228,20 +295,31 @@ def accumulate(gt_box: dict,
             conf.append(dt_score)
     
     if len(match_data['trans_err']) == 0:
-        return None, None
+        return None, None, None, None, None, None
+
+    # Calculate my precision and recall.
+    recall = np.sum(tp).astype(float) / float(gt_count) 
+    precision = np.sum(tp).astype(float) / float(len(sortind))
 
     tp = np.cumsum(tp).astype(float)
     fp = np.cumsum(fp).astype(float)
     conf = np.array(conf)
 
-    # Calculate precision and recall.
     prec = tp / (fp + tp)
     rec = tp / float(gt_count)
 
     rec_interp = np.linspace(0, 1, 101)  # 101 steps, from 0% to 100% recall.
-    prec = np.interp(rec_interp, rec, prec, right=0)
+    prec = np.interp(rec_interp, rec, prec, right=0) #PR曲线
     conf = np.interp(rec_interp, rec, conf, right=0)
     rec = rec_interp
+    PRC = np.vstack((rec, conf, prec))
+
+
+    # ap = calc_my_ap(prec)
+    ap = calc_ap(prec, 0.1, 0.1)
+    # ap3 = calc_ap(prec, 0.1, 0.3)
+    # ap5 = calc_ap(prec, 0.1, 0.5)
+    # ap7 = calc_ap(prec, 0.1, 0.7)
 
     # 25, 50, 75, 80, 85, 90, 95, 99分位
     stat_data = { 'trans_err': [],
@@ -261,8 +339,8 @@ def accumulate(gt_box: dict,
 
             # Then interpolate based on the confidences. (Note reversing since np.interp needs increasing arrays)
             match_data[key] = np.interp(conf[::-1], match_data['conf'][::-1], tmp[::-1])[::-1]
-
-    return match_data, stat_data
+    
+    return match_data, stat_data, PRC.tolist(), precision, recall, ap
 
 def load_json_file(json_file_path):
     with open(json_file_path, 'r') as fin:
@@ -300,7 +378,9 @@ def Json2BBoxInfo(json_file):
                 bboxinfo['scores'] = o[k]['scores'][m]
             elif 'score' in o[k].keys():
                 bboxinfo['scores'] = o[k]['score'][m]
-            bboxinfo['velocity'] = o[k]['velocity'][m]
+
+            if 'velocity' in o[k].keys():
+                bboxinfo['velocity'] = o[k]['velocity'][m]
             json_list.append(bboxinfo)
             json_dict[image_idx].append(bboxinfo)
 
@@ -310,22 +390,24 @@ if __name__ == '__main__':
     # cfg = Config.fromfile('./config.py')
 
     gt_file = '/media/lynn/B2EE9C02EE9BBD53/mf/WANGSHUO/August1/gt.json'
-    dt_file = '/media/lynn/B2EE9C02EE9BBD53/mf/WANGSHUO/August1/dt.json'
-    # dt_file = '/media/lynn/B2EE9C02EE9BBD53/mf/WANGSHUO/August1/cpp_dt2.json'
+    dt_file = '/media/lynn/B2EE9C02EE9BBD53/mf/WANGSHUO/August1/cpp_dt_unknown.json'
 
     dt_list, dt_dict = Json2BBoxInfo(dt_file)
     gt_list, gt_dict = Json2BBoxInfo(gt_file)
 
-    # class_name = ['bicycle', 'pedestr', 'Traffic_cone', 'unknown','car', 'truck', 'bus', 'motorcycle']
-    class_name = ['bicycle']
+    # class_name = ['car', 'truck', 'bus', 'bicycle', 'motorcycle', 'pedestr', 'Traffic_cone', 'Unknown']
+    class_name = ['Unknown']
 
     match_data_cls = {}
     stat_data_cls = {}
 
+    write_path = '/media/lynn/B2EE9C02EE9BBD53/mf/WANGSHUO/August1/nus_stat/'
+
     quantile = [25, 50, 75, 80, 85, 90, 95, 99]
+    metric = ['trans_err', 'scale_err', 'orient_err', 'vel_err']
 
     for cls_name in class_name:
-        match_data, stat_data = accumulate(gt_dict, dt_list,cls_name)
+        match_data, stat_data, PRC, precision, recall, ap = accumulate(gt_dict, dt_list, cls_name, 0.5)
         if match_data is None or stat_data is None:
             print('invalid class_name: ', cls_name)
             continue
@@ -333,7 +415,20 @@ if __name__ == '__main__':
         match_data_cls[cls_name] = match_data
         stat_data_cls[cls_name] = stat_data
 
-        print(cls_name, ':...................')
+        txt_file_name = write_path + '/./' + cls_name + '_quant.csv'
+        txt_file = open(txt_file_name, 'w')
+
+        print(cls_name, ':...................', ap)
+        txt_file.write(cls_name + '\n')
+        txt_file.write('precision,' + str(round(precision, 3)) + '\n')
+        txt_file.write('recall,' + str(round(recall, 3)) + '\n')
+        txt_file.write('AP,' + str(round(ap, 3)) + '\n')
+        txt_file.write('percent')
+        txt_file.write(',min')
+        for q in quantile:
+            txt_file.write(',' + str(q))
+        txt_file.write(',max')
+        txt_file.write('\n')
 
         for key in stat_data.keys():
             total = len(stat_data[key])
@@ -342,21 +437,40 @@ if __name__ == '__main__':
                 divide = (int)(total * level / 100)
                 value = stat_data[key][divide]
                 quant_data[str(level)] = value
+            
+            txt_file.write(key)
+            txt_file.write(',' + str(round(min(stat_data[key]), 3)))
+            for v in quant_data.values():
+                txt_file.write(',' + str(round(v, 3)))
+            txt_file.write(',' + str(round(max(stat_data[key]), 3)))
+            txt_file.write('\n')
 
-            print(key, quant_data, ', max: ', max(stat_data[key]), ', min: ', min(stat_data[key]))
+            # print(key, quant_data, ', max: ', max(stat_data[key]), ', min: ', min(stat_data[key]))
+
+        txt_file.close()
         
-        csv_file_name = cls_name + '.csv'
+        csv_file_name = write_path + '/./' + cls_name + '.csv'
         csv_file = open(csv_file_name, 'w')
         interp_count = 101
         for k in range(interp_count):
-            csv_file.write(str(round(match_data['trans_err'][k],3)))
-            csv_file.write(',')
-            csv_file.write(str(round(match_data['scale_err'][k],3)))
-            csv_file.write(',')
-            csv_file.write(str(round(match_data['orient_err'][k],3)))
-            csv_file.write(',')
-            csv_file.write(str(round(match_data['vel_err'][k],3)))
-            csv_file.write('\n')
+            s = ','.join([str(round(match_data['trans_err'][k],3)),
+                          str(round(match_data['scale_err'][k],3)),
+                          str(round(match_data['orient_err'][k],3)),
+                          str(round(match_data['vel_err'][k],3))])
+            s = s + '\n'
+            csv_file.writelines(s)
         csv_file.close()
+
+        PRC_file_name = write_path + '/./' + cls_name + '_prec.csv'
+        PRC_file = open(PRC_file_name, 'w')
+
+        PRC_file.write(',recall, conf, prec' + '\n')
+        for k in range(len(PRC[0])):
+            s = ','.join([str(round(PRC[0][k],2)), str(round(PRC[1][k], 3)), str(round(PRC[2][k], 3))])
+            s = s + '\n'
+            PRC_file.writelines(s)
+
+        PRC_file.close()
+
 
 
